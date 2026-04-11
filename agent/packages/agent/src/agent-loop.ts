@@ -164,6 +164,64 @@ async function runLoop(
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
+	// sn66 iter72: track whether a successful edit/write has occurred. If the
+	// model reaches the end of its turn without ever producing an edit, we
+	// inject a steering message and retry (bounded). Scoring reads the diff
+	// from disk; an empty diff scores zero regardless of deliberation quality.
+	let hasProducedEdit = false;
+	let noEditRetries = 0;
+	const MAX_NO_EDIT_RETRIES = 2;
+
+	// sn66 iter73: provider-error retry. Gemini Flash (production model) and
+	// GLM-4.7 (dev proxy) both occasionally return stopReason="error" mid-
+	// stream with a partial assistant message and no tool calls. Without a
+	// retry this exits immediately with an empty diff. Injecting a short
+	// continuation prompt and re-streaming salvages the turn. Bounded.
+	let providerErrorRetries = 0;
+	const MAX_PROVIDER_ERROR_RETRIES = 3;
+
+	// sn66 iter74: exploration budget. Force the model to commit to an edit
+	// after a bounded number of non-editing tool calls (read/bash/grep). If
+	// the assistant keeps reading files without ever editing, we inject a
+	// "you have read enough, edit now" nudge and reset the counter. This
+	// prevents over-exploration on tasks where the model's uncertainty keeps
+	// it in a read loop instead of committing to a diff.
+	let nonEditToolCalls = 0;
+	let exploreBudgetNudgesSent = 0;
+	const MAX_EXPLORE_BUDGET = 4;
+	const MAX_EXPLORE_NUDGES = 2;
+
+	// sn66 iter75: elapsed-time pressure nudge. The exploration budget
+	// (iter74) only triggers after MAX_EXPLORE_BUDGET non-edit tool calls,
+	// and the no-edit retry (iter72) only triggers at turn-end. Neither
+	// catches the "model gets stuck in long thinking content after one read"
+	// failure mode (observed on bench-10 iter74: 1528 thinking events but
+	// only 1 tool call across 497s). This timer fires once after the model
+	// has been running for THINKING_TIME_PRESSURE_MS without any successful
+	// edit, regardless of how many tool calls happened. Activates after a
+	// tool result is processed, so it queues for the next turn rather than
+	// interrupting an in-flight stream.
+	const loopStartTime = Date.now();
+	const THINKING_TIME_PRESSURE_MS = 90_000;
+	let thinkingTimePressureSent = false;
+
+	// sn66 iter77: per-file edit-error detector. When the same file
+	// accumulates consecutive failed `edit` tool calls (typically
+	// "Could not find oldText" errors), the model's cached view of that
+	// file is out of sync with disk. Retrying verbatim wastes turns.
+	// Track per-file error counts; at >= threshold, inject a steering
+	// nudge telling the model to switch file OR re-read with a tiny
+	// snippet. Successful edits reset the counter. Single alert per file.
+	// Complements iter72 no-edit retry (empty-diff at turn-end) and
+	// iter74 exploration budget (read-heavy loops): this catches
+	// edit-heavy loops that waste tool calls on the same file.
+	const editErrorsByFile = new Map<string, number>();
+	const stuckEditFilesAlerted = new Set<string>();
+	// sn66 iter84: raised 2→3 to match new king (toothpick-egg/sn66-v15a).
+	// Gives the model one more attempt before steering — less intervention
+	// on genuine struggles, fewer premature nudges on tricky files.
+	const EDIT_ERROR_THRESHOLD = 3;
+
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		let hasMoreToolCalls = true;
@@ -191,7 +249,36 @@ async function runLoop(
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
 
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
+			if (message.stopReason === "aborted") {
+				await emit({ type: "turn_end", message, toolResults: [] });
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			// sn66 iter73: provider-error retry — if the stream cut off with
+			// stopReason="error", inject a continuation nudge and re-stream.
+			// Gated on edit tool presence so mock/unit test setups without
+			// edit tools retain the previous immediate-return behavior.
+			if (message.stopReason === "error") {
+				const hasEditToolForErrRetry = (currentContext.tools ?? []).some(
+					(t) => t.name === "edit" || t.name === "write",
+				);
+				if (hasEditToolForErrRetry && providerErrorRetries < MAX_PROVIDER_ERROR_RETRIES) {
+					providerErrorRetries++;
+					await emit({ type: "turn_end", message, toolResults: [] });
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "The previous response was cut off by a provider error. Continue immediately with a tool call — do NOT write narrative text. Call `read` or `edit` directly. The harness scores the diff on disk; any empty output loses.",
+							},
+						],
+						timestamp: Date.now(),
+					});
+					hasMoreToolCalls = false;
+					continue;
+				}
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -208,10 +295,149 @@ async function runLoop(
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
 					newMessages.push(result);
+					// sn66 iter72: flag first successful edit/write so the
+					// no-edit retry gate below knows we already have a diff.
+					if (!result.isError && (result.toolName === "edit" || result.toolName === "write")) {
+						hasProducedEdit = true;
+						nonEditToolCalls = 0;
+					} else if (!hasProducedEdit && !result.isError) {
+						// sn66 iter74: count non-editing tool calls before the
+						// first successful edit. Resets once editing begins.
+						nonEditToolCalls++;
+					}
 				}
+
+				// sn66 iter77: per-file edit-error detector. Iterate tool
+				// calls paired with their results (index-aligned, which is
+				// how executeToolCalls returns them). When an `edit` call
+				// fails on a specific path, bump that path's counter. At
+				// >= EDIT_ERROR_THRESHOLD consecutive failures without a
+				// successful edit in between, queue a single steering
+				// nudge telling the model to switch strategy. Successful
+				// edits reset the counter for that file.
+				for (let i = 0; i < toolCalls.length; i++) {
+					const call = toolCalls[i];
+					const result = toolResults[i];
+					if (!call || call.type !== "toolCall" || call.name !== "edit") continue;
+					if (!result) continue;
+					const callArgs = call.arguments as { path?: unknown } | undefined;
+					const editPath = typeof callArgs?.path === "string" ? callArgs.path : undefined;
+					if (!editPath) continue;
+					if (result.isError) {
+						const newCount = (editErrorsByFile.get(editPath) ?? 0) + 1;
+						editErrorsByFile.set(editPath, newCount);
+						if (newCount >= EDIT_ERROR_THRESHOLD && !stuckEditFilesAlerted.has(editPath)) {
+							stuckEditFilesAlerted.add(editPath);
+							pendingMessages.push({
+								role: "user",
+								content: [
+									{
+										type: "text",
+										text: `Edit failed ${newCount} times on \`${editPath}\`. Your cached view of this file is out of sync with disk — retrying the same oldText will keep failing because of subtle whitespace/newline differences you can't see in memory. Switch strategy NOW: either (a) pick a DIFFERENT file from the task's acceptance criteria and edit that first, or (b) call \`read\` on \`${editPath}\` one more time then try a much smaller snippet (3-6 lines, not a whole function). Do not retry the failed oldText verbatim.`,
+									},
+								],
+								timestamp: Date.now(),
+							});
+						}
+					} else {
+						editErrorsByFile.set(editPath, 0);
+					}
+				}
+
+				// sn66 iter74: exploration budget — if the agent has made
+				// MAX_EXPLORE_BUDGET non-editing tool calls without any edit,
+				// inject a nudge to commit to an edit. Capped at
+				// MAX_EXPLORE_NUDGES to avoid infinite nudge loops.
+				const hasEditOrWriteToolForBudget = (currentContext.tools ?? []).some(
+					(t) => t.name === "edit" || t.name === "write",
+				);
+				if (
+					hasEditOrWriteToolForBudget &&
+					!hasProducedEdit &&
+					nonEditToolCalls >= MAX_EXPLORE_BUDGET &&
+					exploreBudgetNudgesSent < MAX_EXPLORE_NUDGES &&
+					pendingMessages.length === 0
+				) {
+					exploreBudgetNudgesSent++;
+					nonEditToolCalls = 0;
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "You have read enough files. Commit to the most likely target file and call `edit` on it now. One imperfect edit beats no edit — the scorer only reads the diff on disk. Stop exploring; start editing.",
+							},
+						],
+						timestamp: Date.now(),
+					});
+				}
+
 			}
 
 			await emit({ type: "turn_end", message, toolResults });
+
+			// sn66 iter76: elapsed-time pressure nudge — moved out of the
+			// `if (hasMoreToolCalls)` branch so it can fire even when the
+			// model stops making tool calls (the actual iter74 bench-10
+			// failure mode: 1 early read then pure thinking). iter75 placed
+			// this check inside the tool-call branch and grepping rollouts
+			// confirmed it never fired once. This placement mirrors the
+			// iter72 no-edit retry — runs after turn_end emit, before the
+			// pendingMessages refresh. Single-shot via thinkingTimePressureSent.
+			// Forces loop re-entry only when the turn ended with no more
+			// tool calls (otherwise the next natural turn will consume the
+			// nudge via pendingMessages).
+			const hasEditOrWriteToolForPressure = (currentContext.tools ?? []).some(
+				(t) => t.name === "edit" || t.name === "write",
+			);
+			if (
+				hasEditOrWriteToolForPressure &&
+				!hasProducedEdit &&
+				!thinkingTimePressureSent &&
+				Date.now() - loopStartTime >= THINKING_TIME_PRESSURE_MS &&
+				pendingMessages.length === 0
+			) {
+				thinkingTimePressureSent = true;
+				pendingMessages.push({
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: "Over 90 seconds have elapsed and the diff on disk is still empty. Stop reasoning. Pick one file from the task description, call `edit` on it with your best guess for the change, and let the result speak. Long internal monologues do not score; only the diff scores. Edit now.",
+						},
+					],
+					timestamp: Date.now(),
+				});
+				if (!hasMoreToolCalls) {
+					hasMoreToolCalls = true;
+					continue;
+				}
+			}
+
+			// sn66 iter72: no-edit retry gate. If the model is about to stop
+			// (no more tool calls, no steering queued) but has never produced
+			// a successful edit or write, push a nudge and re-enter the loop
+			// so it takes one more shot at writing a diff. Bounded retries.
+			// Gated on the presence of edit/write tools in the current context
+			// so unit/mock setups without those tools behave unchanged.
+			const hasEditOrWriteTool = (currentContext.tools ?? []).some(
+				(t) => t.name === "edit" || t.name === "write",
+			);
+			if (hasEditOrWriteTool && !hasMoreToolCalls && !hasProducedEdit && noEditRetries < MAX_NO_EDIT_RETRIES && pendingMessages.length === 0) {
+				noEditRetries++;
+				pendingMessages.push({
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: "Your diff is currently empty. The scoring system reads the unified diff from disk — zero edits means zero matches, regardless of analysis quality. Pick the most plausible target file from the task description and call `edit` on it now (or `write` if the task literally says to create a new file). An imperfect edit beats an empty diff.",
+						},
+					],
+					timestamp: Date.now(),
+				});
+				hasMoreToolCalls = true;
+				continue;
+			}
 
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
 		}

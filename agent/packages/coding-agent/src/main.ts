@@ -679,6 +679,17 @@ export async function main(args: string[]) {
 	// First pass: parse args to get --extension paths
 	const firstPass = parseArgs(args);
 	time("parseArgs.firstPass");
+
+	// Solver-mode defaults: reduce overhead for non-interactive runs
+	if (firstPass.mode === "json" && firstPass.noSession) {
+		firstPass.noExtensions = true;
+		firstPass.noSkills = true;
+		firstPass.noPromptTemplates = true;
+		firstPass.noThemes = true;
+		process.env.PI_OFFLINE = "1";
+		process.env.PI_SKIP_VERSION_CHECK = "1";
+	}
+
 	const shouldTakeOverStdout = firstPass.mode !== undefined || firstPass.print || !process.stdin.isTTY;
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
