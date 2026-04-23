@@ -183,9 +183,6 @@ function buildTaskDiscoverySection(taskText: string, cwd: string): string {
 			}
 		}
 
-		sections.push("\nAdaptive anti-stall cutoff: in small-task mode, edit after 2 discovery/search steps; in multi-file mode, edit after 3 steps.");
-		sections.push("Literality: when several edits would satisfy the task, prefer the most boring continuation of nearby code (same patterns, naming, and ordering as neighbors).");
-
 		const namedFiles = taskText.match(/`([^`]+\.[a-zA-Z0-9]{1,6})`/g) || [];
 		const uniqueNamed = [...new Set(namedFiles.map(f => f.replace(/`/g, '').trim()))];
 		if (uniqueNamed.length > 0) {

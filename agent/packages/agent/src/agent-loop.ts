@@ -207,9 +207,6 @@ async function runLoop(
 	// after producing edits, check if read-but-unedited files exist. Single-shot.
 	let coverageCheckDone = false;
 
-	// sn66 iter371: track which files we've already nudged about in multi-file nudge
-	const multiFileNudgePaths = new Set<string>();
-
 	// sn66 iter359: parse expected files from system prompt discovery section
 	// (injected by buildTaskDiscoverySection in iter358). Feeds into coverage check.
 	const expectedFiles = new Set<string>();
@@ -496,32 +493,6 @@ async function runLoop(
 						],
 						timestamp: Date.now(),
 					});
-				}
-
-				// sn66 iter371: time-gated multi-file nudge (king pattern).
-				// When agent has edited ≤3 files after 30s, list specific unedited
-				// target files. Repeatable via notified-path tracking.
-				// iter372: raised threshold from ≤2 to ≤3 for better large-task coverage.
-				if (
-					hasProducedEdit &&
-					pathsEdited.size <= 3 &&
-					(Date.now() - loopStartTime) > 30_000 &&
-					(Date.now() - loopStartTime) < POST_EDIT_TIME_GATE_MS &&
-					pendingMessages.length === 0
-				) {
-					const allKnown = new Set([...pathsRead, ...expectedFiles]);
-					const unnotified = [...allKnown].filter(p => !pathsEdited.has(p) && !multiFileNudgePaths.has(p));
-					if (unnotified.length > 0) {
-						for (const f of unnotified.slice(0, 8)) multiFileNudgePaths.add(f);
-						pendingMessages.push({
-							role: "user",
-							content: [{
-								type: "text",
-								text: `30s+ elapsed and you have only edited ${pathsEdited.size} file(s). ${unnotified.length} discovered target(s) remain: ${unnotified.slice(0, 8).map(f => `\`${f}\``).join(", ")}. Read and edit each one before going back to files you already edited.`,
-							}],
-							timestamp: Date.now(),
-						});
-					}
 				}
 
 			}
