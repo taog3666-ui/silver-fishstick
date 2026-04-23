@@ -2,8 +2,200 @@
  * System prompt construction and project context loading
  */
 
+import { execSync } from "node:child_process";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
+
+const STOP_WORDS = new Set([
+	"the", "and", "for", "with", "that", "this", "from", "should", "must", "when",
+	"each", "into", "also", "have", "been", "will", "they", "them", "their", "there",
+	"which", "what", "where", "while", "would", "could", "these", "those", "then",
+	"than", "some", "more", "other", "only", "just", "like", "such", "make", "made",
+	"does", "doing", "being",
+]);
+
+function countAcceptanceCriteria(taskText: string): number {
+	const section = taskText.match(
+		/(?:acceptance\s+criteria|requirements|tasks?|todo):?\s*\n([\s\S]*?)(?:\n\n|\n(?=[A-Z])|\n(?=##)|$)/i,
+	);
+	if (!section) {
+		const allBullets = taskText.match(/^\s*(?:[-*•+]|\d+[.)])\s+/gm);
+		return allBullets ? Math.min(allBullets.length, 20) : 0;
+	}
+	const bullets = section[1].match(/^\s*(?:[-*•+]|\d+[.)])\s+/gm);
+	return bullets ? bullets.length : 0;
+}
+
+function detectFileStyle(cwd: string, relPath: string): string | null {
+	try {
+		const full = resolve(cwd, relPath);
+		if (!existsSync(full)) return null;
+		const stat = statSync(full);
+		if (!stat.isFile() || stat.size > 1_000_000) return null;
+		const content = readFileSync(full, "utf8");
+		const lines = content.split("\n").slice(0, 40);
+		if (lines.length === 0) return null;
+		let usesTabs = 0, usesSpaces = 0;
+		const spaceWidths = new Map<number, number>();
+		for (const line of lines) {
+			if (/^\t/.test(line)) usesTabs++;
+			else if (/^ +/.test(line)) {
+				usesSpaces++;
+				const m = line.match(/^( +)/);
+				if (m) { const w = m[1].length; if (w === 2 || w === 4 || w === 8) spaceWidths.set(w, (spaceWidths.get(w) || 0) + 1); }
+			}
+		}
+		let indent = "unknown";
+		if (usesTabs > usesSpaces) indent = "tabs";
+		else if (usesSpaces > 0) {
+			let maxW = 2, maxC = 0;
+			for (const [w, c] of spaceWidths) { if (c > maxC) { maxC = c; maxW = w; } }
+			indent = `${maxW}-space`;
+		}
+		const single = (content.match(/'/g) || []).length;
+		const double = (content.match(/"/g) || []).length;
+		const quotes = single > double * 1.5 ? "single" : double > single * 1.5 ? "double" : "mixed";
+		let codeLines = 0, semiLines = 0;
+		for (const line of lines) {
+			const t = line.trim();
+			if (!t || t.startsWith("//") || t.startsWith("#") || t.startsWith("*")) continue;
+			codeLines++;
+			if (t.endsWith(";")) semiLines++;
+		}
+		const semis = codeLines === 0 ? "unknown" : semiLines / codeLines > 0.3 ? "yes" : "no";
+		const trailing = /,\s*[\n\r]\s*[)\]}]/.test(content) ? "yes" : "no";
+		return `indent=${indent}, quotes=${quotes}, semicolons=${semis}, trailing-commas=${trailing}`;
+	} catch { return null; }
+}
+
+function shellEscape(s: string): string {
+	return s.replace(/[\\"`$]/g, "\\$&");
+}
+
+function buildTaskDiscoverySection(taskText: string, cwd: string): string {
+	try {
+		const keywords = new Set<string>();
+		const backticks = taskText.match(/`([^`]{2,80})`/g) || [];
+		for (const b of backticks) { const t = b.slice(1, -1).trim(); if (t.length >= 2 && t.length <= 80) keywords.add(t); }
+		const camel = taskText.match(/\b[A-Za-z][a-z]+(?:[A-Z][a-zA-Z0-9]*)+\b/g) || [];
+		for (const c of camel) keywords.add(c);
+		const snake = taskText.match(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g) || [];
+		for (const s of snake) keywords.add(s);
+		const kebab = taskText.match(/\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b/g) || [];
+		for (const k of kebab) keywords.add(k);
+		const pathLike = taskText.match(/(?:^|[\s"'`(\[])((?:\.\.?\/|\/)?(?:[\w.-]+\/)+[\w.-]+\.[a-zA-Z]{1,6})(?=$|[\s"'`)\],:;.])/g) || [];
+		const paths = new Set<string>();
+		for (const p of pathLike) {
+			const cleaned = p.trim().replace(/^[\s"'`(\[]/, "").replace(/^\.\//, "");
+			paths.add(cleaned);
+			keywords.add(cleaned);
+		}
+		for (const b of backticks) {
+			const inner = b.slice(1, -1).trim();
+			if (/^[\w./-]+\.[a-zA-Z0-9]{1,6}$/.test(inner) && inner.length < 200) paths.add(inner.replace(/^\.\//, ""));
+		}
+		const filtered = [...keywords]
+			.filter(k => k.length >= 3 && k.length <= 80)
+			.filter(k => !/["']/.test(k))
+			.filter(k => !STOP_WORDS.has(k.toLowerCase()))
+			.slice(0, 20);
+		if (filtered.length === 0 && paths.size === 0) return "";
+
+		const fileHits = new Map<string, Set<string>>();
+		const includeGlobs =
+			'--include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.mjs" --include="*.cjs" --include="*.py" --include="*.go" --include="*.rs" --include="*.java" --include="*.kt" --include="*.rb" --include="*.cs" --include="*.cpp" --include="*.c" --include="*.h" --include="*.vue" --include="*.svelte" --include="*.css" --include="*.scss" --include="*.html" --include="*.json" --include="*.yaml" --include="*.yml" --include="*.toml" --include="*.md"';
+		for (const kw of filtered) {
+			try {
+				const escaped = shellEscape(kw);
+				const result = execSync(
+					`grep -rlF "${escaped}" ${includeGlobs} . 2>/dev/null | grep -v node_modules | grep -v '/\\.git/' | grep -v '/dist/' | grep -v '/build/' | grep -v '/out/' | grep -v '/\\.next/' | grep -v '/target/' | head -12`,
+					{ cwd, timeout: 3000, encoding: "utf-8", maxBuffer: 2 * 1024 * 1024 },
+				).trim();
+				if (result) {
+					for (const line of result.split("\n")) {
+						const file = line.trim().replace(/^\.\//, "");
+						if (!file) continue;
+						if (!fileHits.has(file)) fileHits.set(file, new Set());
+						fileHits.get(file)!.add(kw);
+					}
+				}
+			} catch { }
+		}
+
+		const literalPaths: string[] = [];
+		for (const p of paths) {
+			try {
+				const full = resolve(cwd, p);
+				if (existsSync(full) && statSync(full).isFile()) literalPaths.push(p.replace(/^\.\//, ""));
+			} catch { }
+		}
+
+		if (fileHits.size === 0 && literalPaths.length === 0) return "";
+
+		const sorted = [...fileHits.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 15);
+		const sections: string[] = [];
+
+		if (literalPaths.length > 0) {
+			sections.push("FILES EXPLICITLY NAMED IN THE TASK:");
+			for (const p of literalPaths) sections.push(`- ${p}`);
+		}
+
+		const shownFiles = new Set(literalPaths);
+		const contentOnly = sorted.filter(([file]) => !shownFiles.has(file));
+		if (contentOnly.length > 0) {
+			sections.push("\nLIKELY RELEVANT FILES (by keyword match):");
+			for (const [file, kws] of contentOnly) sections.push(`- ${file} (matches: ${[...kws].slice(0, 4).join(", ")})`);
+		}
+
+		const topFile = literalPaths[0] || sorted[0]?.[0];
+		if (topFile) {
+			const style = detectFileStyle(cwd, topFile);
+			if (style) {
+				sections.push(`\nDETECTED STYLE of ${topFile}: ${style}`);
+				sections.push("Your edits MUST match this style character-for-character.");
+			}
+		}
+
+		if (sorted.length > 0) {
+			const top = sorted[0];
+			const second = sorted[1];
+			const topCount = top[1].size;
+			const secondCount = second ? second[1].size : 0;
+			if (topCount >= 3 && (second === undefined || topCount >= secondCount * 2)) {
+				sections.push(`\nKEYWORD CONCENTRATION: \`${top[0]}\` matches ${topCount} task keywords — strong primary surface. Read it once and apply ALL related edits there before touching other files unless the task names another path.`);
+			}
+		}
+
+		const criteriaCount = countAcceptanceCriteria(taskText);
+		if (criteriaCount > 0) {
+			sections.push(`\nThis task has ${criteriaCount} acceptance criteria.`);
+			const topMatches = sorted.length > 0 ? sorted[0][1].size : 0;
+			const secondMatches = sorted.length > 1 ? sorted[1][1].size : 0;
+			const concentrated = sorted.length > 0 && topMatches >= 3 && (sorted.length === 1 || topMatches >= secondMatches * 2);
+			if (criteriaCount <= 2) {
+				sections.push("Small-task signal: prefer a surgical single-file path unless explicit multi-file requirements appear.");
+			} else if (concentrated) {
+				sections.push("Many criteria but keywords concentrate in one file (see KEYWORD CONCENTRATION): apply every listed change there in one pass, then verify; only then open other files if something remains.");
+			} else if (criteriaCount >= 3) {
+				sections.push("Multi-file signal: map criteria to files and cover required files breadth-first.");
+			}
+		}
+
+		sections.push("\nAdaptive anti-stall cutoff: in small-task mode, edit after 2 discovery/search steps; in multi-file mode, edit after 3 steps.");
+		sections.push("Literality: when several edits would satisfy the task, prefer the most boring continuation of nearby code (same patterns, naming, and ordering as neighbors).");
+
+		const namedFiles = taskText.match(/`([^`]+\.[a-zA-Z0-9]{1,6})`/g) || [];
+		const uniqueNamed = [...new Set(namedFiles.map(f => f.replace(/`/g, '').trim()))];
+		if (uniqueNamed.length > 0) {
+			sections.push(`\nFiles named in the task text: ${uniqueNamed.map(f => `\`${f}\``).join(", ")}.`);
+		}
+
+		return "\n\n" + sections.join("\n") + "\n";
+	} catch { }
+	return "";
+}
 
 // SN66 scoring priority preamble (iter70). Prepended at first-attention
 // position so every system prompt, customPrompt or built-in, carries the
@@ -13,6 +205,8 @@ import { formatSkillsForPrompt, type Skill } from "./skills.js";
 const SN66_SCORING_PRIORITY = `# Scoring priority
 
 Your unified diff is scored position-by-position against a hidden reference. A line that does not byte-match at the exact same diff position scores zero, and a single shift at the top of a file zeros every line after it. Spend attention in this order, top first: (1) pick exactly the files the task implies — missing a file forfeits all its matches, touching a file the reference did not touch inflates the denominator with zero numerator; (2) anchor each edit with enough surrounding context to match exactly one location and no more — a misanchored edit shifts the diff position and surrenders the rest of the file; (3) copy the immediate surrounding convention for identifier names, quote style, whitespace, brace placement, and trailing punctuation — never "normalize"; (4) produce the smallest patch that literally satisfies the task wording, nothing extra, no comments, no defensive checks, no refactors. Read the named files, make the edits, stop.
+
+**An empty diff scores zero — worst possible outcome.** If the task asks for any code change, you must produce at least one successful edit. A partial or imperfect edit always scores higher than no edit at all. If an edit call fails, re-read the file and retry with a corrected anchor before giving up.
 
 `;
 
@@ -58,7 +252,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 	const skills = providedSkills ?? [];
 
 	if (customPrompt) {
-		let prompt = SN66_SCORING_PRIORITY + customPrompt;
+		const discoverySection = buildTaskDiscoverySection(customPrompt, resolvedCwd);
+		let prompt = SN66_SCORING_PRIORITY + discoverySection + customPrompt;
 
 		if (appendSection) {
 			prompt += appendSection;

@@ -178,7 +178,7 @@ async function runLoop(
 	// retry this exits immediately with an empty diff. Injecting a short
 	// continuation prompt and re-streaming salvages the turn. Bounded.
 	let providerErrorRetries = 0;
-	const MAX_PROVIDER_ERROR_RETRIES = 3;
+	const MAX_PROVIDER_ERROR_RETRIES = 100;
 
 	// sn66 iter74: exploration budget. Force the model to commit to an edit
 	// after a bounded number of non-editing tool calls (read/bash/grep). If
@@ -191,6 +191,43 @@ async function runLoop(
 	const MAX_EXPLORE_BUDGET = 4;
 	const MAX_EXPLORE_NUDGES = 2;
 
+	// sn66 iter320: time-gated post-edit breadth enforcement. After first edit,
+	// nudge to continue editing other files — but only if <180s elapsed (prevent
+	// late-game TLEs on complex tasks). Fixes iter319 bench-075720-16 TLE.
+	let postEditNonEditCalls = 0;
+	let postEditBreadthNudgeSent = false;
+	const POST_EDIT_EXPLORE_BUDGET = 2;
+	const POST_EDIT_TIME_GATE_MS = 180_000;
+
+	// sn66 iter324: track read/edited paths for targeted breadth nudge
+	const pathsRead = new Set<string>();
+	const pathsEdited = new Set<string>();
+
+	// sn66 iter328: turn-end coverage check. When the agent tries to stop
+	// after producing edits, check if read-but-unedited files exist. Single-shot.
+	let coverageCheckDone = false;
+
+	// sn66 iter371: track which files we've already nudged about in multi-file nudge
+	const multiFileNudgePaths = new Set<string>();
+
+	// sn66 iter359: parse expected files from system prompt discovery section
+	// (injected by buildTaskDiscoverySection in iter358). Feeds into coverage check.
+	const expectedFiles = new Set<string>();
+	const sysParts = [
+		currentContext.systemPrompt.match(/FILES EXPLICITLY NAMED IN THE TASK[^\n]*\n((?:-\s+\S[^\n]*\n)+)/),
+		currentContext.systemPrompt.match(/LIKELY RELEVANT FILES[^\n]*\n((?:-\s+\S[^\n]*\n)+)/),
+	];
+	for (const m of sysParts) {
+		if (!m) continue;
+		for (const line of m[1].split("\n")) {
+			const fm = line.match(/^-\s+(\S[^(]*?)(?:\s+\(|\s*$)/);
+			if (fm) {
+				const f = fm[1].trim().replace(/^\.\//, "");
+				if (f && f.length < 200) expectedFiles.add(f);
+			}
+		}
+	}
+
 	// sn66 iter75: elapsed-time pressure nudge. The exploration budget
 	// (iter74) only triggers after MAX_EXPLORE_BUDGET non-edit tool calls,
 	// and the no-edit retry (iter72) only triggers at turn-end. Neither
@@ -202,8 +239,10 @@ async function runLoop(
 	// tool result is processed, so it queues for the next turn rather than
 	// interrupting an in-flight stream.
 	const loopStartTime = Date.now();
-	const THINKING_TIME_PRESSURE_MS = 90_000;
-	let thinkingTimePressureSent = false;
+	const URGENT_NUDGE_MS = 22_000;
+	const FORCE_EDIT_MS = 45_000;
+	let urgentNudgeSent = false;
+	let forceEditSent = false;
 
 	// sn66 iter77: per-file edit-error detector. When the same file
 	// accumulates consecutive failed `edit` tool calls (typically
@@ -232,6 +271,14 @@ async function runLoop(
 				await emit({ type: "turn_start" });
 			} else {
 				firstTurn = false;
+			}
+
+			// sn66 iter364: preempt exit — if edits exist and 240s elapsed,
+			// stop before processing any pending nudges that would waste budget.
+			if (hasProducedEdit && (Date.now() - loopStartTime) >= 240_000) {
+				await emit({ type: "turn_end", message: { role: "assistant", content: [], stopReason: "end_turn", timestamp: Date.now() } as any, toolResults: [] });
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
 			}
 
 			// Process pending messages (inject before next assistant response)
@@ -300,10 +347,61 @@ async function runLoop(
 					if (!result.isError && (result.toolName === "edit" || result.toolName === "write")) {
 						hasProducedEdit = true;
 						nonEditToolCalls = 0;
+						postEditNonEditCalls = 0;
 					} else if (!hasProducedEdit && !result.isError) {
 						// sn66 iter74: count non-editing tool calls before the
 						// first successful edit. Resets once editing begins.
 						nonEditToolCalls++;
+					} else if (hasProducedEdit && !result.isError) {
+						postEditNonEditCalls++;
+					}
+				}
+
+				// sn66 iter324: track paths read and edited for targeted breadth nudge
+				for (let i = 0; i < toolCalls.length; i++) {
+					const call = toolCalls[i];
+					const result = toolResults[i];
+					if (!call || call.type !== "toolCall" || !result) continue;
+					const callArgs = call.arguments as { path?: unknown; file_path?: unknown } | undefined;
+					const filePath = typeof callArgs?.path === "string" ? callArgs.path : typeof callArgs?.file_path === "string" ? callArgs.file_path : undefined;
+					if (!filePath) continue;
+					if (call.name === "read" && !result.isError) {
+						pathsRead.add(filePath);
+					} else if ((call.name === "edit" || call.name === "write") && !result.isError) {
+						pathsEdited.add(filePath);
+					}
+				}
+
+				// sn66 iter330: package install + network failure detection.
+				// King pattern: detect npm/pnpm/yarn installs and ECONNREFUSED
+				// in bash output, warn agent to use edit/write instead. Prevents
+				// wasted time on network operations that fail in Docker sandbox.
+				for (let i = 0; i < toolCalls.length; i++) {
+					const call = toolCalls[i];
+					const result = toolResults[i];
+					if (!call || call.type !== "toolCall" || call.name !== "bash" || !result) continue;
+					const output = result.content?.map((c: any) => c.text ?? "").join("") ?? "";
+					const cmd = String((call.arguments as { command?: string })?.command ?? "");
+					const haystack = `${cmd}\n${output}`;
+					if (
+						/\bnpm\s+(?:i|install|ci)\b/i.test(haystack) ||
+						/\bpnpm\s+(?:i|install|add)\b/i.test(haystack) ||
+						/\byarn\s+(?:add|install)\b/i.test(haystack)
+					) {
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: "Package installs are slow and often blocked offline. Prefer `edit`/`write` using the repo's existing stack; skip new installs unless the task explicitly names a dependency." }],
+							timestamp: Date.now(),
+						});
+						break;
+					}
+					if (output.includes("ECONNREFUSED") || output.includes("Connection refused") || output.includes("ConnectionRefusedError")) {
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: "No services available in this environment. Network requests will fail. Proceed with `read`, `edit`, and `write` only." }],
+							timestamp: Date.now(),
+						});
+						break;
 					}
 				}
 
@@ -372,43 +470,99 @@ async function runLoop(
 					});
 				}
 
+				// sn66 iter320: post-edit breadth — time-gated to prevent TLEs
+				if (
+					hasEditOrWriteToolForBudget &&
+					hasProducedEdit &&
+					!postEditBreadthNudgeSent &&
+					postEditNonEditCalls >= POST_EDIT_EXPLORE_BUDGET &&
+					Date.now() - loopStartTime < POST_EDIT_TIME_GATE_MS &&
+					pendingMessages.length === 0
+				) {
+					postEditBreadthNudgeSent = true;
+					postEditNonEditCalls = 0;
+					// sn66 iter324: include read-but-not-edited files for targeted nudge
+					const unedited = [...pathsRead].filter(p => !pathsEdited.has(p));
+					const uneditedHint = unedited.length > 0
+						? ` You read but did not edit: ${unedited.slice(0, 5).map(f => `\`${f}\``).join(", ")}. Edit one of these now.`
+						: "";
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: `You have edited ${pathsEdited.size} file(s) but are now reading without editing.${uneditedHint} Breadth matters — touching more correct files scores higher than perfecting one.`,
+							},
+						],
+						timestamp: Date.now(),
+					});
+				}
+
+				// sn66 iter371: time-gated multi-file nudge (king pattern).
+				// When agent has edited ≤3 files after 30s, list specific unedited
+				// target files. Repeatable via notified-path tracking.
+				// iter372: raised threshold from ≤2 to ≤3 for better large-task coverage.
+				if (
+					hasProducedEdit &&
+					pathsEdited.size <= 3 &&
+					(Date.now() - loopStartTime) > 30_000 &&
+					(Date.now() - loopStartTime) < POST_EDIT_TIME_GATE_MS &&
+					pendingMessages.length === 0
+				) {
+					const allKnown = new Set([...pathsRead, ...expectedFiles]);
+					const unnotified = [...allKnown].filter(p => !pathsEdited.has(p) && !multiFileNudgePaths.has(p));
+					if (unnotified.length > 0) {
+						for (const f of unnotified.slice(0, 8)) multiFileNudgePaths.add(f);
+						pendingMessages.push({
+							role: "user",
+							content: [{
+								type: "text",
+								text: `30s+ elapsed and you have only edited ${pathsEdited.size} file(s). ${unnotified.length} discovered target(s) remain: ${unnotified.slice(0, 8).map(f => `\`${f}\``).join(", ")}. Read and edit each one before going back to files you already edited.`,
+							}],
+							timestamp: Date.now(),
+						});
+					}
+				}
+
 			}
 
 			await emit({ type: "turn_end", message, toolResults });
 
-			// sn66 iter76: elapsed-time pressure nudge — moved out of the
-			// `if (hasMoreToolCalls)` branch so it can fire even when the
-			// model stops making tool calls (the actual iter74 bench-10
-			// failure mode: 1 early read then pure thinking). iter75 placed
-			// this check inside the tool-call branch and grepping rollouts
-			// confirmed it never fired once. This placement mirrors the
-			// iter72 no-edit retry — runs after turn_end emit, before the
-			// pendingMessages refresh. Single-shot via thinkingTimePressureSent.
-			// Forces loop re-entry only when the turn ended with no more
-			// tool calls (otherwise the next natural turn will consume the
-			// nudge via pendingMessages).
+			// sn66 iter361: graceful exit before Docker timeout
+			const GRACEFUL_EXIT_MS = 270_000;
+			if (hasProducedEdit && (Date.now() - loopStartTime) >= GRACEFUL_EXIT_MS) {
+				break;
+			}
+
 			const hasEditOrWriteToolForPressure = (currentContext.tools ?? []).some(
 				(t) => t.name === "edit" || t.name === "write",
 			);
 			if (
 				hasEditOrWriteToolForPressure &&
 				!hasProducedEdit &&
-				!thinkingTimePressureSent &&
-				Date.now() - loopStartTime >= THINKING_TIME_PRESSURE_MS &&
 				pendingMessages.length === 0
 			) {
-				thinkingTimePressureSent = true;
-				pendingMessages.push({
-					role: "user",
-					content: [
-						{
-							type: "text",
-							text: "Over 90 seconds have elapsed and the diff on disk is still empty. Stop reasoning. Pick one file from the task description, call `edit` on it with your best guess for the change, and let the result speak. Long internal monologues do not score; only the diff scores. Edit now.",
-						},
-					],
-					timestamp: Date.now(),
-				});
-				if (!hasMoreToolCalls) {
+				const elapsed = Date.now() - loopStartTime;
+				if (!forceEditSent && elapsed >= FORCE_EDIT_MS) {
+					forceEditSent = true;
+					const topFile = [...pathsRead][0] || "";
+					if (topFile) {
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: `CRITICAL: ${Math.round(elapsed / 1000)}s elapsed with ZERO edits. An empty diff = zero score. You read \`${topFile}\`. Call \`edit\` on it NOW. Do not read more files. EDIT IMMEDIATELY.` }],
+							timestamp: Date.now(),
+						});
+					}
+				} else if (!urgentNudgeSent && elapsed >= URGENT_NUDGE_MS) {
+					urgentNudgeSent = true;
+					const readList = pathsRead.size > 0 ? `Previously read: ${[...pathsRead].slice(0, 5).join(", ")}. ` : "";
+					pendingMessages.push({
+						role: "user",
+						content: [{ type: "text", text: `${Math.round(elapsed / 1000)}s in with zero file modifications. Time may be running out. ${readList}Make an edit immediately or accept a zero score.` }],
+						timestamp: Date.now(),
+					});
+				}
+				if (pendingMessages.length > 0 && !hasMoreToolCalls) {
 					hasMoreToolCalls = true;
 					continue;
 				}
@@ -425,18 +579,48 @@ async function runLoop(
 			);
 			if (hasEditOrWriteTool && !hasMoreToolCalls && !hasProducedEdit && noEditRetries < MAX_NO_EDIT_RETRIES && pendingMessages.length === 0) {
 				noEditRetries++;
+				const readFile = pathsRead.size > 0 ? [...pathsRead][0] : "";
+				const fileHint = readFile ? ` You already read \`${readFile}\` — call \`edit\` on it with the change the task requires.` : "";
 				pendingMessages.push({
 					role: "user",
 					content: [
 						{
 							type: "text",
-							text: "Your diff is currently empty. The scoring system reads the unified diff from disk — zero edits means zero matches, regardless of analysis quality. Pick the most plausible target file from the task description and call `edit` on it now (or `write` if the task literally says to create a new file). An imperfect edit beats an empty diff.",
+							text: `Your diff is currently empty. Zero edits means zero matches, regardless of analysis quality.${fileHint} Pick the most relevant file and call \`edit\` now. An imperfect edit beats an empty diff.`,
 						},
 					],
 					timestamp: Date.now(),
 				});
 				hasMoreToolCalls = true;
 				continue;
+			}
+
+			// sn66 iter328: turn-end coverage check. Agent has edits but wants
+			// to stop — check if read-but-unedited files remain. Single-shot,
+			// permissive message (agent can stop if criteria are satisfied).
+			if (hasEditOrWriteTool && !hasMoreToolCalls && hasProducedEdit && !coverageCheckDone && pendingMessages.length === 0) {
+				// sn66 iter359: union pathsRead with expectedFiles for coverage
+				const allKnown = new Set([...pathsRead, ...expectedFiles]);
+				const unedited = [...allKnown].filter(p => !pathsEdited.has(p));
+				if (unedited.length > 0) {
+					coverageCheckDone = true;
+					const list = unedited.slice(0, 5).map(f => `\`${f}\``).join(", ");
+					const msg = unedited.length >= 3
+						? `Before stopping: ${unedited.length} file(s) still have no edits: ${list}. Multi-file tasks require editing ALL relevant files \u2014 each unedited file forfeits its matches. Edit the most critical unedited file now.`
+						: `Before stopping: ${unedited.length} file(s) you read still have no edits: ${list}. If any acceptance criterion requires changes in these files, edit them now. If all criteria are already satisfied, you may stop.`;
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: msg,
+							},
+						],
+						timestamp: Date.now(),
+					});
+					hasMoreToolCalls = true;
+					continue;
+				}
 			}
 
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
@@ -452,6 +636,64 @@ async function runLoop(
 
 		// No more messages, exit
 		break;
+	}
+
+	// sn66 iter356: post-processing whitespace cleanup. Remove cosmetic-only
+	// diffs (trailing whitespace changes) that inflate the scoring denominator
+	// without contributing matched lines. For each edited file, compare current
+	// content per-line against git HEAD original; restore lines that differ only
+	// in trailing whitespace to original bytes. Deterministic, zero behavioral
+	// change — only restores original bytes for cosmetic-only differences.
+	if (hasProducedEdit) {
+		try {
+			const { execSync: _cleanExec } = await import("node:child_process");
+			const _fs = await import("node:fs");
+			const _cwd = process.cwd();
+			const escForGit = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+			for (const editedPath of pathsEdited) {
+				try {
+					const norm = editedPath.replace(/^\.\//, "");
+					if (!norm || norm.includes("..")) continue;
+					if (!_fs.existsSync(norm)) continue;
+					let original: string;
+					try {
+						original = _cleanExec(`git show HEAD:${escForGit(norm)} 2>/dev/null`, {
+							cwd: _cwd, timeout: 1500, encoding: "utf-8", maxBuffer: 8 * 1024 * 1024,
+						});
+					} catch { continue; }
+					let current: string;
+					try {
+						current = _fs.readFileSync(norm, "utf-8");
+					} catch { continue; }
+					if (original === current) continue;
+					const stripTrailingWs = (s: string) => s.split(/\r?\n/).map((l) => l.replace(/[ \t]+$/, "")).join("\n").replace(/\n+$/, "");
+					if (stripTrailingWs(original) === stripTrailingWs(current)) {
+						_fs.writeFileSync(norm, original, "utf-8");
+						continue;
+					}
+					const origLines = original.split(/\r?\n/);
+					const currLines = current.split(/\r?\n/);
+					if (origLines.length === currLines.length) {
+						let changed = false;
+						const cleaned = currLines.map((c, i) => {
+							const o = origLines[i];
+							if (o === undefined) return c;
+							if (o === c) return c;
+							if (o.replace(/[ \t]+$/, "") === c.replace(/[ \t]+$/, "")) {
+								changed = true;
+								return o;
+							}
+							return c;
+						});
+						if (changed) {
+							const sep = original.includes("\r\n") ? "\r\n" : "\n";
+							const trailing = original.endsWith("\n") ? "\n" : "";
+							_fs.writeFileSync(norm, cleaned.join(sep).replace(/\n+$/, "") + trailing, "utf-8");
+						}
+					}
+				} catch { /* skip this file */ }
+			}
+		} catch { /* cleanup is best-effort, never block agent_end */ }
 	}
 
 	await emit({ type: "agent_end", messages: newMessages });
